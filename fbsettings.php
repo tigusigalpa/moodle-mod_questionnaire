@@ -18,7 +18,7 @@ require_once("../../config.php");
 require_once($CFG->dirroot.'/mod/questionnaire/questionnaire.class.php');
 
 $id = required_param('id', PARAM_INT); // Course module ID.
-$currentsection   = $SESSION->questionnaire->currentfbsection;
+$sectionid = required_param('sectionid', PARAM_INT);
 if (! $cm = get_coursemodule_from_id('questionnaire', $id)) {
     print_error('invalidcoursemodule');
 }
@@ -35,7 +35,7 @@ require_course_login($course, true, $cm);
 $context = context_module::instance($cm->id);
 require_once($CFG->dirroot.'/mod/questionnaire/lib.php');
 
-$url = new moodle_url($CFG->wwwroot.'/mod/questionnaire/fbsettings.php', array('id' => $id));
+$url = new moodle_url($CFG->wwwroot.'/mod/questionnaire/fbsettings.php', ['id' => $id, 'sectionid' => $sectionid]);
 $PAGE->set_url($url);
 $PAGE->set_context($context);
 
@@ -49,15 +49,14 @@ $sid = $questionnaire->survey->id;
 $sdata = clone($questionnaire->survey);
 $sdata->sid = $sid;
 $sdata->id = $cm->id;
+$sdata->sectionid = $sectionid;
 
 $feedbacksections = $questionnaire->survey->feedbacksections;
 
 // Get the current section heading.
-$sectionid = null;
 $scorecalculation = null;
-if ($section = $DB->get_record('questionnaire_fb_sections',
-        array('survey_id' => $sid, 'section' => $currentsection))) {
-    $sectionid = $section->id;
+if ($section = $DB->get_record('questionnaire_fb_sections', ['id' => $sectionid])) {
+    $currentsection = $section->section;
     $sectionheading = $section->sectionheading;
     $scorecalculation = $section->scorecalculation;
     $draftideditor = file_get_submitted_draft_itemid('sectionheading');
@@ -67,11 +66,12 @@ if ($section = $DB->get_record('questionnaire_fb_sections',
     $sdata->sectionheading = array('text' => $currentinfo, 'format' => FORMAT_HTML, 'itemid' => $draftideditor);
 }
 
-$feedbackform = new \mod_questionnaire\feedback_form( null, array('currentsection' => $currentsection, 'sectionid' => $sectionid) );
+$feedbackform = new \mod_questionnaire\feedback_section_form(null,
+    ['currentsection' => $currentsection, 'sectionid' => $sectionid]);
 $feedbackform->set_data($sdata);
 if ($feedbackform->is_cancelled()) {
     // Redirect to view questionnaire page.
-    redirect($CFG->wwwroot.'/mod/questionnaire/view.php?id='.$questionnaire->cm->id);
+    redirect($CFG->wwwroot.'/mod/questionnaire/feedback.php?id='.$questionnaire->cm->id);
 }
 if ($settings = $feedbackform->get_data()) {
     $i = 0;
@@ -90,7 +90,7 @@ if ($settings = $feedbackform->get_data()) {
 
     // Save current section.
     $section = new stdClass();
-    $section->survey_id = $settings->sid;
+    $section->survey_id = $sid;
     $section->section = $currentsection;
     $section->scorecalculation = $scorecalculation;
     $section->sectionlabel = $settings->sectionlabel;
@@ -98,8 +98,7 @@ if ($settings = $feedbackform->get_data()) {
     $section->sectionheadingformat = $settings->sectionheading['format'];
 
     // Check if we are updating an existing section record or creating a new one.
-    if ($existsection = $DB->get_record('questionnaire_fb_sections',
-            array('survey_id' => $sid, 'section' => $currentsection) ) ) {
+    if ($existsection = $DB->get_record('questionnaire_fb_sections', ['survey_id' => $sid, 'section' => $currentsection])) {
         $section->id = $existsection->id;
     } else {
         $section->id = $DB->insert_record('questionnaire_fb_sections', $section);
@@ -108,10 +107,8 @@ if ($settings = $feedbackform->get_data()) {
             $context->id, 'mod_questionnaire', 'sectionheading', $section->id,
             array('subdirs' => false, 'maxfiles' => -1, 'maxbytes' => 0),
             $settings->sectionheading['text']);
-    $DB->set_field('questionnaire_fb_sections', 'sectionheading', $sectionheading,
-            array('id' => $section->id));
-    $DB->set_field('questionnaire_fb_sections', 'sectionlabel', $settings->sectionlabel,
-            array('id' => $section->id));
+    $DB->set_field('questionnaire_fb_sections', 'sectionheading', $sectionheading, ['id' => $section->id]);
+    $DB->set_field('questionnaire_fb_sections', 'sectionlabel', $settings->sectionlabel, ['id' => $section->id]);
 
     // Save current section's feedbacks
     // first delete all existing feedbacks for this section - if any
@@ -137,17 +134,16 @@ if ($settings = $feedbackform->get_data()) {
                 array('id' => $feedback->id));
     }
 }
-if (isset($settings->savesettings)) {
-    redirect ($CFG->wwwroot.'/mod/questionnaire/view.php?id='.$questionnaire->cm->id, '', 0);
-} else if (isset($settings->submitbutton)) {
-    $SESSION->questionnaire->currentfbsection ++;
-    redirect ($CFG->wwwroot.'/mod/questionnaire/fbsettings.php?id='.$questionnaire->cm->id, '', 0);
+
+if (isset($settings->submitbutton)) {
+    $url = new moodle_url($CFG->wwwroot.'/mod/questionnaire/feedback.php', ['id' => $questionnaire->cm->id]);
+    redirect ($url, '', 0);
 }
 
 // Print the page header.
-    $PAGE->set_title(get_string('feedbackeditingmessages', 'questionnaire'));
-    $PAGE->set_heading(format_string($course->fullname));
-    $PAGE->navbar->add(get_string('feedbackeditingmessages', 'questionnaire'));
-    echo $OUTPUT->header();
-    $feedbackform->display();
-    echo $OUTPUT->footer($course);
+$PAGE->set_title(get_string('feedbackeditingmessages', 'questionnaire'));
+$PAGE->set_heading(format_string($course->fullname));
+$PAGE->navbar->add(get_string('feedbackeditingmessages', 'questionnaire'));
+echo $OUTPUT->header();
+$feedbackform->display();
+echo $OUTPUT->footer($course);

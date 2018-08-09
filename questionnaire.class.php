@@ -1290,8 +1290,7 @@ class questionnaire {
                 return(false);
             }
         } else {
-            if (empty($sdata->name) || empty($sdata->title)
-                || empty($sdata->realm)) {
+            if (empty($sdata->name) || empty($sdata->title) || empty($sdata->realm)) {
                 return(false);
             }
             if (!isset($sdata->chart_type)) {
