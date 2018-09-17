@@ -28,6 +28,8 @@ defined('MOODLE_INTERNAL') || die();
 define('QUESTIONNAIRE_RESETFORM_RESET', 'questionnaire_reset_data_');
 define('QUESTIONNAIRE_RESETFORM_DROP', 'questionnaire_drop_questionnaire_');
 
+require_once('questionnaire.class.php');
+
 function questionnaire_supports($feature) {
     switch($feature) {
         case FEATURE_BACKUP_MOODLE2:
@@ -41,6 +43,8 @@ function questionnaire_supports($feature) {
         case FEATURE_GRADE_OUTCOMES:
             return false;
         case FEATURE_GROUPINGS:
+            return true;
+        case FEATURE_GROUPMEMBERSONLY:
             return true;
         case FEATURE_GROUPS:
             return true;
@@ -59,6 +63,12 @@ function questionnaire_supports($feature) {
  */
 function questionnaire_get_extra_capabilities() {
     return array('moodle/site:accessallgroups');
+}
+
+function get_questionnaire($questionnaireid) {
+    global $DB;
+
+    return $DB->get_record('questionnaire', array('id' => $questionnaireid));
 }
 
 function questionnaire_add_instance($questionnaire) {
@@ -111,10 +121,6 @@ function questionnaire_add_instance($questionnaire) {
                 // All new questionnaires should be created as "private".
                 // Even if they are *copies* of public or template questionnaires.
                 $DB->set_field('questionnaire_survey', 'realm', 'private', array('id' => $sid));
-            }
-            // If the survey has dependency data, need to set the questionnaire to allow dependencies.
-            if ($DB->count_records('questionnaire_dependency', ['surveyid' => $sid]) > 0) {
-                $questionnaire->navigate = 1;
             }
         }
         $questionnaire->sid = $sid;
@@ -424,7 +430,7 @@ function questionnaire_grade_item_update($questionnaire, $grades = null) {
     }
 
     return grade_update('mod/questionnaire', $questionnaire->courseid, 'mod', 'questionnaire',
-                    $questionnaire->id, 0, $grades, $params);
+        $questionnaire->id, 0, $grades, $params);
 }
 
 /**
@@ -457,6 +463,413 @@ function questionnaire_scale_used ($questionnaireid, $scaleid) {
  */
 function questionnaire_scale_used_anywhere($scaleid) {
     return false;
+}
+
+/**
+ * Get questionnaire data
+ *
+ * @global object $DB
+ * @param int $cmid
+ * @param int|bool $userid
+ * @return array
+ * @throws moodle_exception
+ */
+function get_questionnaire_data($cmid, $userid = false) {
+    global $DB, $USER;
+
+    if ($q = get_coursemodule_from_id('questionnaire', $cmid)) {
+        if (!$questionnaire = get_questionnaire($q->instance)) {
+            throw new \moodle_exception("invalidcoursemodule", "error");
+        }
+    }
+    $ret = [
+        'questionnaire' => [
+            'id' => $questionnaire->id,
+            'name' => format_string($questionnaire->name),
+            'intro' => $questionnaire->intro,
+            'userid' => intval($userid ? $userid : $USER->id),
+            'survey_id' => intval($questionnaire->sid)
+        ],
+        'response' => [
+            'id' => 0,
+            'survey_id' => 0,
+            'submitted' => 0,
+            'complete' => 'n',
+            'grade' => 0,
+            'userid' => 0,
+            'fullname' => '',
+            'userdate' => '',
+        ],
+        'fields' => [],
+        'responses' => [],
+        'questionscount' => 0,
+        'pagescount' => 1,
+    ];
+    $sql = 'SELECT qq.*,qqt.response_table FROM '
+        . '{questionnaire_question} qq LEFT JOIN {questionnaire_question_type} qqt '
+        . 'ON qq.type_id = qqt.typeid WHERE qq.survey_id = ? AND qq.deleted = ? '
+        . 'ORDER BY qq.position';
+    if ($questions = $DB->get_records_sql($sql, [$questionnaire->sid, 'n'])) {
+        require_once('classes/question/base.php');
+        $pagenum = 1;
+        $context = \context_module::instance($cmid);
+        foreach ($questions as $question) {
+            $ret['questionscount']++;
+            $fieldkey = 'response_'.$question->type_id.'_'.$question->id;
+            $options = ['noclean' => true, 'para' => false, 'filter' => true,
+                'context' => $context, 'overflowdiv' => true];
+            if ($question->type_id != QUESPAGEBREAK) {
+                $ret['questionsinfo'][$pagenum][$question->id] =
+                $ret['fields'][$fieldkey] = [
+                    'id' => $question->id,
+                    'survey_id' => $question->survey_id,
+                    'name' => $question->name,
+                    'type_id' => $question->type_id,
+                    'length' => $question->length,
+                    'content' => format_text(file_rewrite_pluginfile_urls(
+                        $question->content, 'pluginfile.php', $context->id,
+                        'mod_questionnaire', 'question', $question->id),
+                        FORMAT_HTML, $options),
+                    'content_stripped' => strip_tags($question->content),
+                    'required' => $question->required,
+                    'deleted' => $question->deleted,
+                    'response_table' => $question->response_table,
+                    'fieldkey' => $fieldkey,
+                    'precise' => $question->precise,
+                    'errormessage' => get_string('required') . ': ' . $question->name
+                ];
+            }
+            $std = new \stdClass();
+            $std->id = $std->choice_id = 0;
+            $std->question_id = $question->id;
+            $std->content = '';
+            $std->value = null;
+            switch ($question->type_id) {
+                case QUESYESNO: // Yes/No bool
+                    $stdyes = new \stdClass();
+                    $stdyes->id = 1;
+                    $stdyes->choice_id = 'y';
+                    $stdyes->question_id = $question->id;
+                    $stdyes->value = null;
+                    $stdyes->content = get_string('yes');
+                    $stdyes->isbool = true;
+                    if ($ret['questionsinfo'][$pagenum][$question->id]['required']) {
+                        $stdyes->value = 'y';
+                        $stdyes->firstone = true;
+                    }
+                    $ret['questions'][$pagenum][$question->id][1] = $stdyes;
+
+                    $stdno = new \stdClass();
+                    $stdno->id = 0;
+                    $stdno->choice_id = 'n';
+                    $stdno->question_id = $question->id;
+                    $stdno->value = null;
+                    $stdno->content = get_string('no');
+                    $stdno->isbool = true;
+                    $ret['questions'][$pagenum][$question->id][0] = $stdno;
+
+                    $ret['questionsinfo'][$pagenum][$question->id]['isbool'] = true;
+                    break;
+                case QUESTEXT: // Text
+                case QUESESSAY: // Essay
+                    $ret['questions'][$pagenum][$question->id][0] = $std;
+                    $ret['questionsinfo'][$pagenum][$question->id]['istextessay'] = true;
+                    break;
+                case QUESRADIO: // Radiobutton
+                case QUESCHECK: // Checkbox
+                case QUESDROP: // Select
+                case QUESRATE: // Rate 1-NN
+                    $excludes = [];
+                    if ($items = $DB->get_records('questionnaire_quest_choice',
+                        ['question_id' => $question->id])) {
+                        if ($question->type_id == QUESRADIO) {
+                            $ret['questionsinfo'][$pagenum][$question->id]['isradiobutton'] = true;
+                        }
+                        if ($question->type_id == QUESCHECK) {
+                            $ret['questionsinfo'][$pagenum][$question->id]['ischeckbox'] = true;
+                        }
+                        if ($question->type_id == QUESDROP) {
+                            $ret['questionsinfo'][$pagenum][$question->id]['isselect'] = true;
+                        }
+                        if ($question->type_id == QUESRATE) {
+                            $ret['questionsinfo'][$pagenum][$question->id]['israte'] = true;
+                            $vals = $extracontents = [];
+                            foreach ($items as $item) {
+                                $item->na = false;
+                                if ($question->precise == 0) {
+                                    $ret['questions'][$pagenum][$question->id][$item->id] = $item;
+                                    if ($ret['questionsinfo'][$pagenum][$question->id]['required'] == 'y') {
+                                        $ret['questions'][$pagenum][$question->id][$item->id]->min
+                                            = $ret['questions'][$pagenum][$question->id][$item->id]->minstr = 1;
+                                    } else {
+                                        $ret['questions'][$pagenum][$question->id][$item->id]->min
+                                            = $ret['questions'][$pagenum][$question->id][$item->id]->minstr = 0;
+                                    }
+                                    $ret['questions'][$pagenum][$question->id][$item->id]->max
+                                        = $ret['questions'][$pagenum][$question->id][$item->id]->maxstr
+                                        = intval($question->length);
+                                } else if ($question->precise == 1) {
+                                    $ret['questions'][$pagenum][$question->id][$item->id] = $item;
+                                    if ($ret['questionsinfo'][$pagenum][$question->id]['required'] == 'y') {
+                                        $ret['questions'][$pagenum][$question->id][$item->id]->min
+                                            = $ret['questions'][$pagenum][$question->id][$item->id]->minstr = 1;
+                                    } else {
+                                        $ret['questions'][$pagenum][$question->id][$item->id]->min
+                                            = $ret['questions'][$pagenum][$question->id][$item->id]->minstr = 0;
+                                    }
+                                    $ret['questions'][$pagenum][$question->id][$item->id]->max = intval($question->length) + 1;
+                                    $ret['questions'][$pagenum][$question->id][$item->id]->na = true;
+                                    $extracontents[] = $ret['questions'][$pagenum][$question->id][$item->id]->max
+                                        . ' = ' . get_string('notapplicable', 'mod_questionnaire');
+                                } else if ($question->precise > 1) {
+                                    $excludes[$item->id] = $item->id;
+                                    if ($item->value == null) {
+                                        if ($arr = explode('|', $item->content)) {
+                                            if (count($arr) == 2) {
+                                                $ret['questions'][$pagenum][$question->id][$item->id] = $item;
+                                                $ret['questions'][$pagenum][$question->id][$item->id]->content = '';
+                                                $ret['questions'][$pagenum][$question->id][$item->id]->minstr = $arr[0];
+                                                $ret['questions'][$pagenum][$question->id][$item->id]->maxstr = $arr[1];
+                                            }
+                                        }
+                                    } else {
+                                        $val = intval($item->value);
+                                        $vals[$val] = $val;
+                                        $extracontents[] = $item->content;
+                                    }
+                                }
+                            }
+                            if ($vals) {
+                                if ($q = $ret['questions'][$pagenum][$question->id]) {
+                                    foreach (array_keys($q) as $itemid) {
+                                        $ret['questions'][$pagenum][$question->id][$itemid]->min = min($vals);
+                                        $ret['questions'][$pagenum][$question->id][$itemid]->max = max($vals);
+                                    }
+                                }
+                            }
+                            if ($extracontents) {
+                                $extracontents = array_unique($extracontents);
+                                $extrahtml = '<br><ul>';
+                                foreach ($extracontents as $extracontent) {
+                                    $extrahtml .= '<li>'.$extracontent.'</li>';
+                                }
+                                $extrahtml .= '</ul>';
+                                $ret['questionsinfo'][$pagenum][$question->id]['content'] .= format_text($extrahtml, FORMAT_HTML, $options);
+                            }
+                        }
+                        foreach ($items as $item) {
+                            if (!in_array($item->id, $excludes)) {
+                                $item->choice_id = $item->id;
+                                if ($item->value == null) {
+                                    $item->value = '';
+                                }
+                                $ret['questions'][$pagenum][$question->id][$item->id] = $item;
+                                if ($question->type_id != QUESRATE) {
+                                    if ($ret['questionsinfo'][$pagenum][$question->id]['required']) {
+                                        if (!isset($ret['questionsinfo'][$pagenum][$question->id]['firstone'])) {
+                                            $ret['questionsinfo'][$pagenum][$question->id]['firstone'] = true;
+                                            $ret['questions'][$pagenum][$question->id][$item->id]->value = intval($item->choice_id);
+                                            $ret['questions'][$pagenum][$question->id][$item->id]->firstone = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                case QUESPAGEBREAK:
+                    $ret['questionscount']--;
+                    $ret['pagescount']++;
+                    $pagenum++;
+                    continue;
+            }
+        }
+        if ($userid) {
+            if ($response = $DB->get_record_sql('SELECT qr.* FROM {questionnaire_response} qr '
+                . 'LEFT JOIN {user} u ON qr.userid = u.id WHERE qr.survey_id = ? '
+                . 'AND qr.userid = ?', [$questionnaire->id, $userid])) {
+                $ret['response'] = (array) $response;
+                $ret['response']['submitted_userdate'] = '';
+                if (isset($ret['response']['submitted']) && !empty($ret['response']['submitted'])) {
+                    $ret['response']['submitted_userdate'] = userdate($ret['response']['submitted']);
+                }
+                $ret['response']['fullname'] = fullname($DB->get_record('user', ['id' => $userid]));
+                $ret['response']['userdate'] = userdate($ret['response']['submitted']);
+                foreach ($ret['questionsinfo'] as $pagenum => $data1) {
+                    foreach ($data1 as $questionid => $data2) {
+                        if (isset($data2['response_table']) && !empty($data2['response_table'])) {
+                            if ($values = $DB->get_records_sql('SELECT * FROM {questionnaire_'
+                                . $data2['response_table'] . '} WHERE response_id = ? AND question_id = ?',
+                                [$response->id, $questionid])) {
+                                foreach ($values as $value) {
+                                    switch($data2['type_id']) {
+                                        case QUESYESNO: // Yes/No bool
+                                            if (isset($ret['questions'][$pagenum][$questionid])) {
+                                                if (isset($value->choice_id) && !empty($value->choice_id)) {
+                                                    if ($value->choice_id == 'y') {
+                                                        $ret['questions'][$pagenum][$questionid][1]->value = 'y';
+                                                        $ret['responses']['response_'.$data2['type_id'].'_'.$questionid] = 'y';
+                                                    } else {
+                                                        $ret['questions'][$pagenum][$questionid][0]->value = 'n';
+                                                        $ret['responses']['response_'.$data2['type_id'].'_'.$questionid] = 'n';
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        case QUESTEXT: // Text
+                                        case QUESESSAY: // Essay
+                                            if (isset($value->response) && !empty($value->response)) {
+                                                $ret['questions'][$pagenum][$questionid][0]->value = $value->response;
+                                                $ret['responses']['response_'.$data2['type_id'].'_'.$questionid] = $value->response;
+                                            }
+                                            break;
+                                        case QUESRADIO: // Radiobutton
+                                        case QUESCHECK: // Checkbox
+                                        case QUESDROP: // Select
+                                            if ($value = $DB->get_records_sql('SELECT * FROM {questionnaire_'
+                                                . $data2['response_table'] . '} WHERE response_id = ? AND question_id = ?',
+                                                [$response->id, $questionid])) {
+                                                foreach ($value as $row) {
+                                                    foreach ($ret['questions'][$pagenum][$questionid] as $k => $item) {
+                                                        if ($item->id == $row->choice_id) {
+                                                            $ret['questions'][$pagenum][$questionid][$k]->value = intval($item->id);
+                                                            $ret['responses']['response_'.$data2['type_id'].'_'.$questionid] = intval($item->id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        case QUESRATE: // Rate 1-NN
+                                            if ($value = $DB->get_records_sql('SELECT * FROM {questionnaire_'
+                                                . $data2['response_table'] . '} WHERE response_id = ? AND question_id = ?',
+                                                [$response->id, $questionid])) {
+                                                foreach ($value as $row) {
+                                                    if ($questionid == $row->question_id) {
+                                                        $v = $row->rank + 1;
+                                                        if ($ret['questionsinfo'][$pagenum][$questionid]['precise'] == 1) {
+                                                            if ($row->rank == -1) {
+                                                                $v = $ret['questions'][$pagenum][$questionid][$row->choice_id]->max;
+                                                            }
+                                                        }
+                                                        $ret['questions'][$pagenum][$questionid][$row->choice_id]->value
+                                                            = $ret['responses']['response_'.$data2['type_id'].'_'.$questionid.'_'.$row->choice_id] = $v;
+                                                        $ret['questions'][$pagenum][$questionid][$row->choice_id]->choice_id = $row->choice_id;
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return $ret;
+}
+
+function save_questionnaire_data($questionnaireid, $surveyid, $userid, $cmid, $sec, $completed, $submit, array $responses) {
+    global $DB;
+    $ret = [
+        'responses' => [],
+        'warnings' => []
+    ];
+    if (!$completed) {
+        require_once('questionnaire.class.php');
+
+        $cm = get_coursemodule_from_id('questionnaire', $cmid);
+        $questionnaire = new \questionnaire($questionnaireid, null,
+            $DB->get_record('course', ['id' => $cm->course]), $cm);
+        $rid = $questionnaire->delete_insert_response(
+            $DB->get_field('questionnaire_response', 'id',
+                ['survey_id' => $surveyid, 'complete' => 'n',
+                    'userid' => $userid]), $sec, $userid);
+        $questionnairedata = get_questionnaire_data($cmid, $userid);
+        $pagequestions = $questionnairedata['questions'][$sec];
+        $pagequestionsids = array_keys($pagequestions);
+        $missingquestions = $warningmessages = [];
+        foreach ($pagequestionsids as $questionid) {
+            $missingquestions[$questionid] = $questionid;
+        }
+        foreach ($pagequestionsids as $questionid) {
+            foreach ($responses as $response) {
+                $args = explode('_', $response['name']);
+                if (count($args) >= 3) {
+                    $typeid = intval($args[1]);
+                    $rquestionid = intval($args[2]);
+                    if (in_array($rquestionid, $pagequestionsids)) {
+                        unset($missingquestions[$rquestionid]);
+                        if ($rquestionid == $questionid) {
+                            if ($typeid == $questionnairedata['questionsinfo'][$sec][$rquestionid]['type_id']) {
+                                if ($rquestionid > 0 && !in_array($response['value'], array(-9999, 'undefined'))) {
+                                    switch ($questionnairedata['questionsinfo'][$sec][$rquestionid]['type_id']) {
+                                        case QUESRATE:
+                                            if (isset($args[3]) && !empty($args[3])) {
+                                                $choiceid = intval($args[3]);
+                                                $value = intval($response['value']) - 1;
+                                                $rec = new \stdClass();
+                                                $rec->response_id = $rid;
+                                                $rec->question_id = intval($rquestionid);
+                                                $rec->choice_id = $choiceid;
+                                                $rec->rank = $value;
+                                                if ($questionnairedata['questionsinfo'][$sec][$rquestionid]['precise'] == 1) {
+                                                    if ($value == $questionnairedata['questions'][$sec][$rquestionid][$choiceid]->max) {
+                                                        $rec->rank = -1;
+                                                    }
+                                                }
+                                                $DB->insert_record('questionnaire_response_rank', $rec);
+                                            }
+                                            break;
+                                        default:
+                                            if ($questionnairedata['questionsinfo'][$sec][$rquestionid]['required'] == 'n'
+                                                || ($questionnairedata['questionsinfo'][$sec][$rquestionid]['required'] == 'y'
+                                                    && !empty($response['value']))) {
+                                                $questionobj = \mod_questionnaire\question\base::question_builder(
+                                                    $questionnairedata['questionsinfo'][$sec][$rquestionid]['type_id'],
+                                                    $questionnairedata['questionsinfo'][$sec][$rquestionid]);
+                                                if ($questionobj->insert_response($rid, $response['value'])) {
+                                                    $ret['responses'][$rid][$questionid] = $response['value'];
+                                                }
+                                            } else {
+                                                $ret['warnings'][] = [
+                                                    'item' => 'mod_questionnaire_question',
+                                                    'itemid' => $questionid,
+                                                    'warningcode' => 'required',
+                                                    'message' => s(get_string('required') . ': ' . $questionnairedata['questionsinfo'][$sec][$questionid]['name'])
+                                                ];
+                                            }
+                                    }
+                                } else {
+                                    $missingquestions[$rquestionid] = $rquestionid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ($missingquestions) {
+            foreach ($missingquestions as $questionid) {
+                if ($questionnairedata['questionsinfo'][$sec][$questionid]['required'] == 'y') {
+                    $ret['warnings'][] = [
+                        'item' => 'mod_questionnaire_question',
+                        'itemid' => $questionid,
+                        'warningcode' => 'required',
+                        'message' => s(get_string('required') . ': ' . $questionnairedata['questionsinfo'][$sec][$questionid]['name'])
+                    ];
+                }
+            }
+        }
+    }
+    if ($submit && (!isset($ret['warnings']) || empty($ret['warnings']))) {
+        $questionnaire->commit_submission_response(
+            $DB->get_field('questionnaire_response', 'id',
+                ['survey_id' => $surveyid, 'complete' => 'n',
+                    'userid' => $userid]), $userid);
+    }
+    return $ret;
 }
 
 /**
@@ -533,7 +946,7 @@ function questionnaire_pluginfile($course, $cm, $context, $filearea, $args, $for
  * @SuppressWarnings(PHPMD.UnusedFormalParameter)
  */
 function questionnaire_extend_settings_navigation(settings_navigation $settings,
-        navigation_node $questionnairenode) {
+                                                  navigation_node $questionnairenode) {
 
     global $PAGE, $DB, $USER, $CFG;
     $individualresponse = optional_param('individualresponse', false, PARAM_INT);
@@ -742,7 +1155,7 @@ function questionnaire_get_post_actions() {
 }
 
 function questionnaire_get_recent_mod_activity(&$activities, &$index, $timestart,
-                $courseid, $cmid, $userid = 0, $groupid = 0) {
+                                               $courseid, $cmid, $userid = 0, $groupid = 0) {
 
     global $CFG, $COURSE, $USER, $DB;
     require_once($CFG->dirroot . '/mod/questionnaire/locallib.php');
@@ -840,11 +1253,11 @@ function questionnaire_get_recent_mod_activity(&$activities, &$index, $timestart
             if (($groupmode == SEPARATEGROUPS) && !$accessallgroups) {
                 if ($usersgroups === null) {
                     $usersgroups = groups_get_all_groups($course->id,
-                    $attempt->userid, $cm->groupingid);
+                        $attempt->userid, $cm->groupingid);
                     if (is_array($usersgroups)) {
                         $usersgroups = array_keys($usersgroups);
                     } else {
-                         $usersgroups = array();
+                        $usersgroups = array();
                     }
                 }
                 if (!array_intersect($usersgroups, $modinfo->groups[$cm->id])) {
@@ -929,18 +1342,18 @@ function questionnaire_print_recent_mod_activity($activity, $courseid, $detail, 
     }
     echo html_writer::start_tag('div');
     echo html_writer::start_tag('span', array('class' => 'clearfix',
-                    'style' => 'margin-top:0px; background-color: white; display: inline-block;'));
+        'style' => 'margin-top:0px; background-color: white; display: inline-block;'));
 
     if (!$activity->anonymous && !$activity->cannotview) {
         echo html_writer::tag('div', $OUTPUT->user_picture($activity->user, array('courseid' => $courseid)),
-                        array('style' => 'float: left; padding-right: 10px;'));
+            array('style' => 'float: left; padding-right: 10px;'));
     }
     if (!$activity->cannotview) {
         echo html_writer::start_tag('div');
         echo html_writer::start_tag('div');
 
         $urlparams = array('action' => 'vresp', 'instance' => $activity->cminstance,
-                        'group' => $activity->groupid, 'rid' => $activity->content->attemptid, 'individualresponse' => 1);
+            'group' => $activity->groupid, 'rid' => $activity->content->attemptid, 'individualresponse' => 1);
 
         $context = context_module::instance($activity->cmid);
         if (has_capability('mod/questionnaire:viewsingleresponse', $context)) {
@@ -949,7 +1362,7 @@ function questionnaire_print_recent_mod_activity($activity, $courseid, $detail, 
             $report = 'myreport.php';
         }
         echo html_writer::tag('a', get_string('response', 'questionnaire').' '.$activity->nbattempts.$stranonymous,
-                        array('href' => new moodle_url('/mod/questionnaire/'.$report, $urlparams)));
+            array('href' => new moodle_url('/mod/questionnaire/'.$report, $urlparams)));
         echo html_writer::end_tag('div');
     } else {
         echo html_writer::start_tag('div');
@@ -1008,10 +1421,10 @@ function questionnaire_print_overview($courses, &$htmlarray) {
 
         // The questionnaire has a deadline.
         if (($questionnaire->closedate != 0)
-                        // And it is before the deadline has been met.
-                        && ($questionnaire->closedate >= $now)
-                        // And the questionnaire is available.
-                        && (($questionnaire->opendate == 0) || ($questionnaire->opendate <= $now))) {
+            // And it is before the deadline has been met.
+            && ($questionnaire->closedate >= $now)
+            // And the questionnaire is available.
+            && (($questionnaire->opendate == 0) || ($questionnaire->opendate <= $now))) {
             if (!$questionnaire->visible) {
                 $class = ' class="dimmed"';
             } else {
@@ -1019,7 +1432,7 @@ function questionnaire_print_overview($courses, &$htmlarray) {
             }
             $str = $OUTPUT->box("$strquestionnaire:
                             <a$class href=\"$CFG->wwwroot/mod/questionnaire/view.php?id=$questionnaire->coursemodule\">".
-                            format_string($questionnaire->name).'</a>', 'name');
+                format_string($questionnaire->name).'</a>', 'name');
 
             // Deadline.
             $str .= $OUTPUT->box(get_string('closeson', 'questionnaire', userdate($questionnaire->closedate)), 'info');
@@ -1072,7 +1485,7 @@ function questionnaire_print_overview($courses, &$htmlarray) {
 function questionnaire_reset_course_form_definition($mform) {
     $mform->addElement('header', 'questionnaireheader', get_string('modulenameplural', 'questionnaire'));
     $mform->addElement('advcheckbox', 'reset_questionnaire',
-                    get_string('removeallquestionnaireattempts', 'questionnaire'));
+        get_string('removeallquestionnaireattempts', 'questionnaire'));
 }
 
 /**
@@ -1131,14 +1544,14 @@ function questionnaire_reset_userdata($data) {
             }
         }
         $status[] = array(
-                        'component' => $componentstr,
-                        'item' => get_string('deletedallresp', 'questionnaire'),
-                        'error' => false);
+            'component' => $componentstr,
+            'item' => get_string('deletedallresp', 'questionnaire'),
+            'error' => false);
 
         $status[] = array(
-                        'component' => $componentstr,
-                        'item' => get_string('gradesdeleted', 'questionnaire'),
-                        'error' => false);
+            'component' => $componentstr,
+            'item' => get_string('gradesdeleted', 'questionnaire'),
+            'error' => false);
     }
     return $status;
 }
@@ -1184,7 +1597,7 @@ function questionnaire_get_completion_state($course, $cm, $userid, $type) {
  * @return \core_calendar\local\event\entities\action_interface|null
  */
 function mod_questionnaire_core_calendar_provide_event_action(calendar_event $event,
-                                                            \core_calendar\action_factory $factory) {
+                                                              \core_calendar\action_factory $factory) {
     $cm = get_fast_modinfo($event->courseid)->instances['questionnaire'][$event->instance];
 
     $completion = new \completion_info($cm->get_course());
@@ -1196,10 +1609,10 @@ function mod_questionnaire_core_calendar_provide_event_action(calendar_event $ev
     }
 
     return $factory->create_instance(
-            get_string('view'),
-            new \moodle_url('/mod/questionnaire/view.php', ['id' => $cm->id]),
-            1,
-            true
+        get_string('view'),
+        new \moodle_url('/mod/questionnaire/view.php', ['id' => $cm->id]),
+        1,
+        true
     );
 }
 
